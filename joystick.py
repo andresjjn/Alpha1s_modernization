@@ -3,6 +3,7 @@ from alpha1s import Alpha1s
 from alpha1s.constants import walk, init
 from time import sleep
 
+
 def main():
     pygame.init()
     robot = Alpha1s()
@@ -13,10 +14,10 @@ def main():
     _joystick.init()
     current = 0
     while True:
-        for i in range (current, len(walk)):
+        for i in range(current, len(walk)):
             pygame.event.pump()
             value = _joystick.get_axis(1)
-            if  value < -0.1:
+            if value < -0.1:
                 print(i)
                 robot.servo_write_all(walk[i])
                 sleep(1 + value)
@@ -25,6 +26,7 @@ def main():
                 robot.servo_write_all(init)
                 break
             current = 0
+
 
 if __name__ == '__main__':
     main()
