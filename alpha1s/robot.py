@@ -4,28 +4,22 @@ from prettytable import PrettyTable
 from time import sleep
 
 
-class Alpha1S:
+class Alpha1s:
     def __init__(self, name: str = "ALPHA 1S"):
         self.__bt = alpha1s_bluetooth(name)
 
-    def battery(self) -> Optional[Dict[str, int]]:
+    def battery(self):
         msg = b'\x18\x00'
         parameter_len = 4
         ans = self.__bt.read(msg, parameter_len)
         if ans is not None:
-            battery = {
-                "percent": int.from_bytes(ans[3:], "big"),
-                "state": int.from_bytes(ans[2:3], "big"),
-                "mV": int.from_bytes(ans[:2], "big")
-            }
-            return battery
-        return None
+            print(f"Battery with {int.from_bytes(ans[3:], 'big')}% of charge | {int.from_bytes(ans[:2], 'big')}mv ")
 
     def led_handler(self, state: bool):
         msg = b'\x0D' + (b'\x01' if state else b'\x00')
         self.__bt.write(msg)
 
-    def servo_read(self, servo_id: int) -> Optional[int]:
+    def servo_read(self, servo_id: int):
         servo_id = bytes([servo_id+1])
         msg = b'\x24' + servo_id
         parameter_len = 2
@@ -34,7 +28,7 @@ class Alpha1S:
             return int.from_bytes(ans[1:], "big")
         return None
 
-    def servo_read_all(self) -> Optional[List[int]]:
+    def servo_read_all(self):
         msg = b'\x25\x00'
         parameter_len = 16
         ans = self.__bt.read(msg, parameter_len)
@@ -46,7 +40,7 @@ class Alpha1S:
             return [x for x in ans]
         return None
 
-    def servo_write(self, servo_id: int, angle: int, travelling: int = 20) -> Optional[int]:
+    def servo_write(self, servo_id: int, angle: int, travelling: int = 20):
         servo_id = bytes([servo_id+1])
         angle = bytes([angle])
         run_time = bytes([travelling])

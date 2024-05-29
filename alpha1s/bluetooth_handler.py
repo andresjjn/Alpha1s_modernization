@@ -20,7 +20,7 @@ class alpha1s_bluetooth:
         if self.sock:
             self.sock.close()
 
-    def __discover(self, name: str) -> Optional[str]:
+    def __discover(self, name: str):
         try:
             devices = bluetooth.discover_devices(lookup_names=True)
             for addr, text in devices:
@@ -32,9 +32,11 @@ class alpha1s_bluetooth:
 
     def __connect(self, addr: str):
         try:
+            print(f"Connecting with Robot {addr}")
             self.sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
             self.sock.connect((addr, 6))
             self.sock.settimeout(10.0)
+            print('Connected')
         except bluetooth.BluetoothError as e:
             logger.error(f"Error connecting to device: {e}")
             self.sock = None
@@ -48,11 +50,11 @@ class alpha1s_bluetooth:
             if self.sock:
                 self.sock.close()
 
-    def write(self, msg: bytes):
+    def write(self, msg):
         cmd = self.__compose(msg)
         self.sock.send(cmd)
 
-    def read(self, msg: bytes, ans_len: int) -> Optional[bytes]:
+    def read(self, msg: bytes, ans_len: int):
         self.write(msg)
         length = 6 + ans_len
         ans = self.sock.recv(length)
