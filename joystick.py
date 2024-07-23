@@ -3,7 +3,6 @@ from alpha1s import Alpha1s
 from alpha1s.constants import walk, init
 from time import sleep
 
-
 def main():
     pygame.init()
     robot = Alpha1s()
@@ -26,7 +25,6 @@ def main():
                 robot.servo_write_all(init)
                 break
             current = 0
-
 
 if __name__ == '__main__':
     main()

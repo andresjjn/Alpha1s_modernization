@@ -9,8 +9,9 @@ class alpha1s_bluetooth:
     def __init__(self, name: str):
         self.sock = None
         address = self.__discover(name)
+        print("Finding a Robot")
         if address is not None:
-            logger.info("Robot found")
+            print("Robot found")
             self.__connect(address)
         else:
             logger.error(f"Error: {name} not found")

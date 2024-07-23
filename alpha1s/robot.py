@@ -6,6 +6,7 @@ from time import sleep
 
 class Alpha1s:
     def __init__(self, name: str = "ALPHA 1S"):
+        print("Alpha 1S Robot Controller")
         self.__bt = alpha1s_bluetooth(name)
 
     def battery(self):
@@ -52,7 +53,7 @@ class Alpha1s:
             return int.from_bytes(ans[1:], "big")
         return None
 
-    def servo_write_all(self, angles: List[int], travelling: int = 20) -> Optional[List[int]]:
+    def servo_write_all(self, angles: List[int], travelling: int = 20):
         if len(angles) != 16:
             return None
         angles = bytearray(angles)
