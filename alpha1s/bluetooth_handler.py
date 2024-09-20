@@ -39,7 +39,8 @@ class alpha1s_bluetooth:
             self.sock.settimeout(10.0)
             print('Connected')
         except bluetooth.BluetoothError as e:
-            logger.error(f"Error connecting to device: {e}")
+            logger.error(
+                f"Error co# Asegúrate de que estas constantes estén definidasnnecting to device: {e}")
             self.sock = None
 
     @contextmanager
@@ -54,6 +55,7 @@ class alpha1s_bluetooth:
     def write(self, msg):
         cmd = self.__compose(msg)
         self.sock.send(cmd)
+# Asegúrate de que estas constantes estén definidas
 
     def read(self, msg: bytes, ans_len: int):
         self.write(msg)
