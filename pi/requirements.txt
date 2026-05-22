@@ -1,0 +1,6 @@
+pyaudio
+numpy
+SpeechRecognition
+requests
+pybluez
+# piper installed as CLI, not pip
