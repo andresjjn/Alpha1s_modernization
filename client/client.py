@@ -1,137 +1,125 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-raspberry_client.py
+raspberry_client_gestos.py
 Cliente de voz para Alpha 1S. Contrato JSON: claves en INGLES.
 
+FASE 1 (limpieza, Mayo 2026):
+  - Eliminado: htsparser, pygame, audioop, AVAILABLE_CHOREOGRAPHIES,
+    play_choreography, execute_dance.
+  - Reemplazo: audioop.rms() -> numpy RMS.
+  - Renombre: MAC_IP -> SERVER_IP (independiente del host concreto).
+  - Anadido: instrumentacion de Fase 0 (metrics.py) con timestamps t0-t7.
+
+FASE 2 (STT remoto, Mayo 2026):
+  - Eliminado: import whisper, carga de modelo whisper local.
+  - Anadido: transcribe_audio_remote() que envia WAV al ROG /transcribe.
+  - La Pi solo graba y envia; faster-whisper large-v3-turbo corre en el ROG.
+  - Nuevos timestamps en metrics: t1b (POST /transcribe), t1c (respuesta STT).
+
+FASE USB (Mayo 2026):
+  - Eliminado: from alpha1s import Alpha1S (Bluetooth RFCOMM).
+  - Anadido: from alpha1s_usb import Alpha1SUSB (USB HID, /dev/hidrawX).
+  - servo_write_all(angles, travelling=X) -> set_all_servos(angles, speed=X).
+  - Frames de gestos usan _send_no_reply() para no esperar ACK -> gestos mas fluidos.
+  - Heartbeat thread cada 8s para mantener la conexion USB activa.
+  - query_llm_server: el ROG (Fase 3) retorna JSON directamente, no envuelto.
+
 Archivo en ASCII puro. Los acentos del castellano se expresan con
-escapes Unicode (é = e con tilde, ñ = enie, etc.) para
-que Piper los pronuncie bien sin meter chars no-ASCII en el codigo.
+escapes Unicode para que Piper los pronuncie bien.
 
 EXTENSION MAYO 2026: gesture_sequence
--------------------------------------
-El LLM puede acompanar respuestas tipo "response" con una lista de
-gestos corporales que se ejecutan EN PARALELO con la voz de Piper.
-
-Contrato extendido:
-  {
-    "response": "Hola, soy Alpha 1S",
-    "gesture_sequence": ["brazos_abiertos_bienvenida", "presentarse"]
-  }
-
-Los gestos solo mueven los servos de los brazos (IDs 0-5). Las
-piernas (IDs 6-15) permanecen rigidamente en la pose 'init' real
-para no comprometer el equilibrio mientras el robot habla.
-
-PENDIENTE DE MIGRAR:
-  - import whisper       -> STT ahora corre en ROG via /transcribe
-  - import audioop       -> eliminado en nueva arquitectura
-  - import htsparser     -> eliminado (sistema de coreografia antiguo)
-  - import pygame        -> eliminado (musica de coreografia antigua)
-  - MAC_IP               -> actualizar a IP del ROG Ally X
-  - transcribe_audio_local() -> reemplazar por llamada HTTP a ROG /transcribe
+El LLM acompana respuestas tipo "response" con gestos corporales
+que se ejecutan EN PARALELO con la voz de Piper.
 """
 
 import os
 import wave
-import whisper
 import requests
 import pyaudio
 import speech_recognition as sr
-import audioop
+import numpy as np
 import subprocess
 import json
 from time import sleep
 import ast
 import threading
 
-from alpha1s import Alpha1S
-import htsparser
-import pygame
+from alpha1s_usb import Alpha1SUSB
+from stream_parser import speak_stream   # Fase 4: turno por streaming SSE
+
+# Cache de bateria: se lee en startup y se refresca en background.
+# El firmware del Alpha 1S no responde a 0x18 durante operacion activa.
+_battery_cache = {"pct": None, "ts": 0.0}
+BATTERY_REFRESH_INTERVAL = 60.0  # segundos entre lecturas en background
+
+# Instrumentacion Fase 0. Si el modulo falla, el cliente sigue
+# corriendo sin metricas (no debe bloquear operacion normal).
+try:
+    from metrics import InteractionMetrics
+    _METRICS_AVAILABLE = True
+except Exception as _e:
+    print("[PI] metrics.py no disponible: " + str(_e))
+    _METRICS_AVAILABLE = False
 
 # ---------- CONFIG ----------
 WAKE_WORD = "alfa"
-WHISPER_MODEL_SIZE = "base"
-WHISPER_LANGUAGE = "es"
 TEMP_AUDIO_FILENAME = "temp_recording.wav"
-MAC_IP = "192.168.1.12"
-MAC_SERVER_URL = "http://" + MAC_IP + ":3000/query"
 
-RATE = 16000
-CHUNK = 1024
-CHANNELS = 1
-FORMAT = pyaudio.paInt16
-SILENCE_THRESHOLD = 300
-SILENCE_DURATION = 2
+SERVER_IP      = "192.168.1.10"
+SERVER_URL     = "http://" + SERVER_IP + ":3000/query"
+TRANSCRIBE_URL = "http://" + SERVER_IP + ":3000/transcribe"
+STREAM_URL     = "http://" + SERVER_IP + ":3000/query_stream"
+
+# Fase 4: streaming SSE. False = flujo no-stream actual (intacto).
+# True = habla por frases y lanza gestos en paralelo. Probar en hardware.
+USE_STREAMING  = False
+
+# Audio in
+RATE                 = 16000
+CHUNK                = 1024
+CHANNELS             = 1
+FORMAT               = pyaudio.paInt16
+SILENCE_THRESHOLD    = 300
+SILENCE_DURATION     = 2
 MAX_RECORDING_SECONDS = 30
 
+# Microfono USB: index 2 = pulse (PulseAudio, resamplea 44100->16kHz).
+# Index 0 = hw:2,0 directo, falla con paInvalidSampleRate a 16kHz.
+MIC_DEVICE_INDEX = 2
+
 VOICE_MODEL_PATH = "es_MX-claude-high.onnx"
+METRICS_CSV_PATH = "metrics.csv"
+
+# Heartbeat USB: evita timeout de inactividad en el robot.
+USB_HEARTBEAT_INTERVAL = 8   # segundos
 
 # ---------- SALUDO INICIAL ----------
-# Texto que dice Piper al arrancar. Usa escapes Unicode para mantener
-# el archivo ASCII puro pero que la pronunciacion sea correcta.
-# Equivale a: "Saludos Andres, en que te puedo ayudar hoy?"
 STARTUP_GREETING_TEXT = (
-    "Saludos Andrés, ¿en qué te puedo ayudar hoy?"
+    "Saludos Andr\u00e9s, \u00bfen qu\u00e9 te puedo ayudar hoy?"
 )
 
 # ---------- CATALOGOS ----------
-# Claves en INGLES (el LLM las emite); valores son angulos de los 16 servos.
-# Mapeo de servos:
-#   0: Hombro D Roll      1: Hombro I Roll      2: Brazo D Pitch    3: Brazo I Pitch
-#   4: Codo D             5: Codo I             6: Cadera D Pitch   7: Cadera I Pitch
-#   8: Cadera D Roll      9: Cadera I Roll     10: Rodilla D       11: Rodilla I
-#  12: Tobillo D Pitch   13: Tobillo I Pitch   14: Tobillo D Roll  15: Tobillo I Roll
 STATIC_POSES = {
-    # Pose neutra: brazos caidos, piernas rectas. Postura estable de pie.
     "init":     [90, 0, 90, 90, 177, 90, 90, 60, 76, 110, 90, 90, 120, 104, 70, 90],
-
-    # Manos arriba: brazo izquierdo elevado por encima de la cabeza.
     "hands_up": [90, 180, 90, 90, 0, 90, 90, 60, 76, 110, 90, 90, 120, 104, 70, 90],
 }
 
 SEQUENCE_FILES = {
-    "mover_adelante":                "mover_adelante.txt",
-    "mover_atras":                   "mover_atras.txt",
-    "girar_a_la_derecha":            "girar_a_la_derecha.txt",
-    "girar_a_la_izquierda":          "girar_a_la_izquierda.txt",
-    "punetazo_derecho":              "punetazo_derecho.txt",
-    "punetazo_izquierdo":            "punetazo_izquierdo.txt",
-    "flexiones_de_pecho":            "flexiones_de_pecho.txt",
-    "levantarse_desde_el_frente":    "levantarse_desde_el_frente.txt",
-    "levantarse_desde_la_espalda":   "levantarse_desde_la_espalda.txt",
-    "mover_a_la_derecha":            "mover_a_la_derecha.txt",
-    "mover_a_la_izquierda":          "mover_a_la_izquierda.txt",
-    "posicion_inicial":              "posicion_inicial.txt",
-    "saludo_inicial":                "saludo_inicial.txt",
-    "reverencia":                    "reverencia.txt",
+    "mover_adelante":              "mover_adelante.txt",
+    "mover_atras":                 "mover_atras.txt",
+    "girar_a_la_derecha":          "girar_a_la_derecha.txt",
+    "girar_a_la_izquierda":        "girar_a_la_izquierda.txt",
+    "punetazo_derecho":            "punetazo_derecho.txt",
+    "punetazo_izquierdo":          "punetazo_izquierdo.txt",
+    "flexiones_de_pecho":          "flexiones_de_pecho.txt",
+    "levantarse_desde_el_frente":  "levantarse_desde_el_frente.txt",
+    "levantarse_desde_la_espalda": "levantarse_desde_la_espalda.txt",
+    "mover_a_la_derecha":          "mover_a_la_derecha.txt",
+    "mover_a_la_izquierda":        "mover_a_la_izquierda.txt",
+    "posicion_inicial":            "posicion_inicial.txt",
 }
 
-AVAILABLE_CHOREOGRAPHIES = {
-    "frozen", "beat_it", "gangnam_style", "happy_birthday",
-    "just_the_way_you_are", "moves_like_jagger", "remix",
-    "sorry_sorry", "that_power", "trojan_horse", "waka_waka",
-    "presentacion",
-    "sirius", "default", "default_foot1", "bueno",
-    "fall_backward_rise1", "fall_forward_rise1",
-    "push_up",
-    "hit_left", "hit_right",
-    "left_hits_forward", "right_hits_forward",
-    "left_punch", "right_punch",
-    "left_slide_tackle1", "right_slide_tackle1",
-    "shoot_left1", "shoot_right1",
-    "move_back", "move_forward", "move_leftward", "move_rightward",
-    "turn_left", "turn_right", "turn_left1", "turn_right1",
-    "leftward1", "rightward1", "backward2", "forward2",
-}
-
-# ---------- CATALOGO DE GESTOS ----------
-# Gestos corporales para acompanar respuestas habladas. Solo mueven
-# los brazos (servos 0-5). Las piernas (6-15) se mantienen en pose
-# 'init' en cada frame para no comprometer el equilibrio.
-#
-# Cada valor es la duracion total aproximada del gesto en segundos.
-# El LLM la usa para sumar gestos hasta cubrir la duracion del audio.
 GESTURE_CATALOG = {
     "enfatizar_breve":             2.4,
     "afirmar":                     2.4,
@@ -145,10 +133,56 @@ GESTURE_CATALOG = {
     "hablar_relajado":             5.4,
     "despedirse":                  4.0,
     "saludar":                     3.5,
-    "error":                       3.5,
+    "saludo_inicial":              3.5,  # mueve torso, probado en hardware
+    "reverencia":                  3.5,  # mueve torso, probado en hardware
 }
 
 GESTURES_DIR = "gestures"
+
+# Singleton de metricas. Inicializado en main() si esta disponible.
+metrics = None
+
+
+# ---------- UTILIDADES ----------
+def _calc_rms(data_bytes):
+    """RMS de un bloque PCM int16 LE. Equivale a audioop.rms(data, 2)."""
+    samples = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float32)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples * samples)))
+
+
+def _mark(stage):
+    """Wrapper seguro sobre metrics.mark(). No falla si metrics es None."""
+    if metrics is not None:
+        metrics.mark(stage)
+
+
+def _set_meta(**kwargs):
+    """Wrapper seguro sobre metrics.set_meta()."""
+    if metrics is not None:
+        metrics.set_meta(**kwargs)
+
+
+# ---------- HEARTBEAT USB ----------
+def _start_heartbeat(robot, stop_event):
+    """
+    Envia un heartbeat al robot cada USB_HEARTBEAT_INTERVAL segundos
+    para mantener la conexion HID activa.
+    Corre en un thread daemon: muere automaticamente al salir el proceso.
+    """
+    def _loop():
+        while not stop_event.wait(timeout=USB_HEARTBEAT_INTERVAL):
+            try:
+                if robot.is_connected():
+                    robot.heartbeat()
+            except Exception as e:
+                print("[HB] Error en heartbeat USB: " + str(e))
+
+    t = threading.Thread(target=_loop, daemon=True, name="usb-heartbeat")
+    t.start()
+    return t
+
 
 # ---------- TTS ----------
 def initialize_piper_voice():
@@ -161,6 +195,7 @@ def initialize_piper_voice():
 
 def generate_tts_wav(text, voice_model_path, output_wav_path="response.wav"):
     """Genera el WAV con Piper. No lo reproduce. Retorna la ruta o None."""
+    _mark("t5_piper_start")
     try:
         subprocess.run(
             ["piper", "--model", voice_model_path, "--output_file", output_wav_path],
@@ -175,14 +210,20 @@ def generate_tts_wav(text, voice_model_path, output_wav_path="response.wav"):
 def play_wav_file(wav_path):
     """Reproduce un WAV. Bloqueante. Limpia el archivo al final."""
     p = pyaudio.PyAudio()
+    first_chunk = True
     try:
         with wave.open(wav_path, "rb") as wf:
-            stream = p.open(format=p.get_format_from_width(wf.getsampwidth()),
-                            channels=wf.getnchannels(),
-                            rate=wf.getframerate(),
-                            output=True)
+            stream = p.open(
+                format=p.get_format_from_width(wf.getsampwidth()),
+                channels=wf.getnchannels(),
+                rate=wf.getframerate(),
+                output=True
+            )
             data = wf.readframes(CHUNK)
             while data:
+                if first_chunk:
+                    _mark("t6_audio_first_chunk")
+                    first_chunk = False
                 stream.write(data)
                 data = wf.readframes(CHUNK)
             stream.stop_stream()
@@ -205,33 +246,29 @@ def speak(text, voice_model_path):
 
 def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
     """
-    Reproduce el TTS y los gestos corporales EN PARALELO.
+    Reproduce el TTS y los gestos EN PARALELO.
 
     Flujo:
-      1. Genera el WAV de Piper (bloqueante, 50-500 ms).
-      2. Lanza un thread que ejecuta los gestos en secuencia.
+      1. Genera el WAV de Piper (bloqueante, ~50-500ms).
+      2. Lanza thread de gestos.
       3. Reproduce el WAV en el thread principal.
-      4. Espera al thread de gestos (con margen de gracia).
-      5. Al terminar, vuelve a la pose 'init' para postura segura.
-
-    Si gesture_sequence es None/vacio o robot es None, solo habla.
+      4. Espera al thread de gestos con margen de gracia.
+      5. Vuelve a pose init para postura segura.
     """
-    # Sin gestos: ruta directa
     if not gesture_sequence or robot is None:
         speak(text, voice_model_path)
         return
 
     print("[PI] Hablando con gestos: " + text)
-    print("[GESTURE] Secuencia solicitada: " + str(gesture_sequence))
+    print("[GESTURE] Secuencia: " + str(gesture_sequence))
 
-    # 1) Generar WAV antes de lanzar el thread para sincronizar bien
     wav_path = generate_tts_wav(text, voice_model_path)
     if not wav_path:
         print("[PI] Fallo TTS. Cancelando gestos.")
         return
 
-    # 2) Lanzar thread de gestos
-    stop_event = threading.Event()
+    stop_event  = threading.Event()
+    usb_marked  = {"done": False}
 
     def run_gestures():
         for gesture_name in gesture_sequence:
@@ -239,66 +276,131 @@ def speak_with_gestures(text, voice_model_path, gesture_sequence, robot):
                 print("[GESTURE] Stop recibido, abortando secuencia.")
                 break
             if gesture_name not in GESTURE_CATALOG:
-                print("[GESTURE] '" + gesture_name + "' no esta en el catalogo. Saltando.")
+                print("[GESTURE] '" + gesture_name + "' no en catalogo. Saltando.")
                 continue
             try:
+                if not usb_marked["done"]:
+                    _mark("t7_usb_command_sent")
+                    usb_marked["done"] = True
                 play_gesture(gesture_name, robot)
             except Exception as e:
-                print("[GESTURE] Error ejecutando '" + gesture_name + "': " + str(e))
-                # Continua con el siguiente gesto sin abortar el audio
+                print("[GESTURE] Error en '" + gesture_name + "': " + str(e))
 
     gesture_thread = threading.Thread(target=run_gestures, daemon=True)
     gesture_thread.start()
 
-    # 3) Reproducir audio (bloqueante) en el thread principal
     play_wav_file(wav_path)
 
-    # 4) Esperar al thread de gestos con margen de gracia
-    grace_period = 1.5  # segundos
-    gesture_thread.join(timeout=grace_period)
+    gesture_thread.join(timeout=1.5)
     if gesture_thread.is_alive():
-        print("[SYNC] Audio termino, senalando stop al thread de gestos.")
+        print("[SYNC] Audio termino antes que los gestos. Senalando stop.")
         stop_event.set()
         gesture_thread.join(timeout=3.0)
         if gesture_thread.is_alive():
             print("[SYNC] Advertencia: thread de gestos no termino limpiamente.")
 
-    # 5) Volver a init para postura segura
+    # Volver a init para postura segura
     try:
-        robot.servo_write_all(STATIC_POSES["init"], travelling=50)
+        robot.set_all_servos(STATIC_POSES["init"], speed=50)
         sleep(0.5)
     except Exception as e:
         print("[GESTURE] Error volviendo a init: " + str(e))
 
 
+# ---------- FASE 4: TURNO POR STREAMING (opt-in) ----------
+def try_streaming_turn(user_text, voice_model, robot, battery_pct=None):
+    """
+    Maneja un turno via SSE /query_stream.
+    Habla por frases conforme llegan; lanza gestos en paralelo en cuanto
+    se conoce gesture_sequence (el prompt la emite PRIMERO).
+
+    Retorna:
+      ("done",     None)       conversacional ya hablado + gestos ejecutados
+      ("action",   data_dict)  era accion fisica -> el caller la despacha
+      ("fallback", None)       el streaming fallo -> usar flujo no-stream
+    """
+    _mark("t2_post_start")
+    gesture_stop = threading.Event()
+    gthread = {"t": None}
+
+    def piper_speak(frase):
+        print("[STREAM] Frase -> Piper: " + frase)
+        wav = generate_tts_wav(frase, voice_model, output_wav_path="resp_stream.wav")
+        if wav:
+            play_wav_file(wav)
+
+    def on_gestures(gestures):
+        if robot is None:
+            return
+        valid = [g for g in gestures if isinstance(g, str) and g in GESTURE_CATALOG]
+        if not valid:
+            return
+        print("[STREAM] Gestos en paralelo: " + str(valid))
+
+        def run():
+            _mark("t7_usb_command_sent")
+            for g in valid:
+                if gesture_stop.is_set():
+                    break
+                try:
+                    play_gesture(g, robot)
+                except Exception as e:
+                    print("[GESTURE] Error en '" + g + "': " + str(e))
+
+        t = threading.Thread(target=run, daemon=True)
+        gthread["t"] = t
+        t.start()
+
+    try:
+        data = speak_stream(STREAM_URL, user_text, piper_speak,
+                             on_gestures=on_gestures,
+                             battery_pct=battery_pct)
+    except Exception as e:
+        print("[STREAM] Fallo, fallback no-stream: " + str(e))
+        return ("fallback", None)
+
+    if data is None:
+        return ("fallback", None)
+
+    # Marcas aproximadas: en streaming t3/t4 ocurren al cerrar el stream.
+    _mark("t3_llm_response_received")
+    _mark("t4_json_parsed")
+
+    if data.get("action"):
+        return ("action", data)
+
+    # Conversacional: cerrar gestos y volver a init (postura segura)
+    if gthread["t"]:
+        gthread["t"].join(timeout=1.5)
+        if gthread["t"].is_alive():
+            print("[SYNC] Audio termino antes que los gestos. Stop.")
+            gesture_stop.set()
+            gthread["t"].join(timeout=3.0)
+    if robot:
+        try:
+            robot.set_all_servos(STATIC_POSES["init"], speed=50)
+            sleep(0.5)
+        except Exception as e:
+            print("[GESTURE] Error volviendo a init: " + str(e))
+
+    _set_meta(action_type="response",
+              response_text=data.get("response", ""),
+              gesture_count=len(data.get("gesture_sequence") or []))
+    return ("done", None)
+
+
 # ---------- SALUDO INICIAL ----------
 def startup_greeting(robot, voice_model_path):
     print("[GREETING] Iniciando saludo de bienvenida...")
-    pose_thread = None
-
     if robot is not None:
-        def do_pose():
-            try:
-                play_sequence("saludo_inicial", robot)
-            except Exception as e:
-                print("[GREETING] Error moviendo a pose 'greeting': " + str(e))
-
-        pose_thread = threading.Thread(target=do_pose)
-        pose_thread.start()
-
-    sleep(0.2)
-    speak(STARTUP_GREETING_TEXT, voice_model_path)
-
-    if pose_thread is not None:
-        pose_thread.join()
-        sleep(1)
-        try:
-            robot.servo_write_all(STATIC_POSES["init"], travelling=80)
-            sleep(1)
-        except Exception as e:
-            print("[GREETING] Error volviendo a 'init': " + str(e))
-
+        speak_with_gestures(
+            STARTUP_GREETING_TEXT, voice_model_path,
+            ["saludo_inicial"], robot,
+        )
+    else:
+        speak(STARTUP_GREETING_TEXT, voice_model_path)
     print("[GREETING] Saludo finalizado.")
+
 
 # ---------- AUDIO ----------
 def listen_for_wake_word(recognizer, microphone):
@@ -308,8 +410,9 @@ def listen_for_wake_word(recognizer, microphone):
         while True:
             try:
                 audio = recognizer.listen(source)
-                text = recognizer.recognize_google(audio, language="es-ES").lower()
+                text  = recognizer.recognize_google(audio, language="es-ES").lower()
                 if WAKE_WORD in text:
+                    _mark("t0_wake_word_detected")
                     print("[PI] Palabra de activacion detectada.")
                     return True
             except (sr.UnknownValueError, sr.RequestError):
@@ -318,25 +421,27 @@ def listen_for_wake_word(recognizer, microphone):
 
 def record_audio(stream):
     print("[PI] Grabando... Habla ahora.")
-    frames = []
-    silent_chunks = 0
+    frames              = []
+    silent_chunks       = 0
     silent_chunks_needed = int(SILENCE_DURATION * RATE / CHUNK)
-    max_chunks = int(MAX_RECORDING_SECONDS * RATE / CHUNK)
-    has_spoken = False
+    max_chunks          = int(MAX_RECORDING_SECONDS * RATE / CHUNK)
+    has_spoken          = False
 
     while len(frames) < max_chunks:
         data = stream.read(CHUNK, exception_on_overflow=False)
         frames.append(data)
-        rms = audioop.rms(data, 2)
+        rms = _calc_rms(data)
         if rms >= SILENCE_THRESHOLD:
-            has_spoken = True
+            has_spoken    = True
             silent_chunks = 0
         elif has_spoken:
             silent_chunks += 1
         if has_spoken and silent_chunks > silent_chunks_needed:
+            _mark("t1_recording_end")
             print("[PI] Silencio detectado. Grabacion finalizada.")
             return b"".join(frames)
 
+    _mark("t1_recording_end")
     print("[PI] Tope maximo de grabacion alcanzado.")
     return b"".join(frames)
 
@@ -349,36 +454,127 @@ def save_as_wav(frames, audio_interface, filename):
         wf.writeframes(frames)
     return filename
 
-# ---------- STT y LLM ----------
-def transcribe_audio_local(audio_filepath, model):
-    print("[PI] Transcribiendo con Whisper...")
+
+# ---------- STT + LLM ----------
+def transcribe_audio_remote(audio_filepath):
+    """Envia el WAV al ROG /transcribe. faster-whisper corre en el ROG."""
+    print("[PI] Enviando audio al servidor STT...")
+    _mark("t1b_stt_post_start")
     try:
-        result = model.transcribe(audio_filepath, fp16=False, language=WHISPER_LANGUAGE)
-        return result["text"]
-    except Exception as e:
-        print("[PI] Error transcripcion: " + str(e))
+        with open(audio_filepath, "rb") as f:
+            files = {"audio": (os.path.basename(audio_filepath), f, "audio/wav")}
+            response = requests.post(TRANSCRIBE_URL, files=files, timeout=30)
+        response.raise_for_status()
+        _mark("t1c_stt_response_received")
+        text = response.json().get("text", "").strip()
+        print("[PI] STT resultado: '" + text + "'")
+        return text if text else None
+    except requests.exceptions.RequestException as e:
+        _mark("t1c_stt_response_received")
+        print("[PI] Error conexion STT: " + str(e))
         return None
 
 
-def query_llm_server(text):
+def _parse_battery(bat: dict):
+    """Extrae nivel (0-100) de un dict de get_battery(). None si no disponible."""
+    if not bat:
+        return None
+    level = bat.get("level")
+    if isinstance(level, (int, float)) and 1 <= level <= 100:
+        return int(level)
+    voltage_mv = bat.get("voltage_mv", 0)
+    if voltage_mv > 0:
+        pct = int(max(0, min(100, (voltage_mv - 6000) / 2400 * 100)))
+        return pct
+    return None
+
+
+def _read_battery_hw(robot):
+    """Lectura directa al hardware. Solo llamar cuando el robot está inactivo."""
+    if robot is None:
+        return None
+    try:
+        bat = robot.get_battery()
+        return _parse_battery(bat)
+    except Exception as e:
+        print("[BATTERY] Excepcion en get_battery(): " + str(e))
+    return None
+
+
+def _read_battery(robot):
+    """
+    Devuelve el nivel de batería desde caché.
+    El firmware Alpha 1S no responde a 0x18 durante operación activa,
+    por lo que nunca se llama al hardware durante un turno conversacional.
+    La caché se actualiza en startup y por el thread de background.
+    """
+    pct = _battery_cache.get("pct")
+    if pct is not None:
+        print("[BATTERY] Nivel (cache): " + str(pct) + "%")
+    return pct
+
+
+def _battery_refresh_loop(robot, stop_event):
+    """
+    Thread daemon: refresca la caché de batería cada BATTERY_REFRESH_INTERVAL
+    segundos. Solo intenta leer cuando el robot lleva >2s sin actividad de servos
+    (heurística: el intervalo largo entre heartbeats ya garantiza eso).
+    """
+    while not stop_event.wait(BATTERY_REFRESH_INTERVAL):
+        pct = _read_battery_hw(robot)
+        if pct is not None:
+            _battery_cache["pct"] = pct
+            _battery_cache["ts"]  = time.time()
+            print("[BATTERY] Cache refrescada: " + str(pct) + "%")
+
+
+def query_llm_server(text, battery_pct=None):
+    """
+    Envia el texto al ROG /query y retorna el JSON del LLM como string.
+
+    battery_pct: porcentaje leido antes de esta llamada. El ROG lo inyecta
+                 en el contexto del LLM para que pueda informarlo si el
+                 usuario pregunta. None si no esta disponible.
+
+    Robusto a dos formatos de respuesta del ROG:
+      - Directo (Fase 4+):  {"response":"...", "gesture_sequence":[...]}
+      - Envuelto (legacy):  {"response": "<json_string>"}
+    """
     print("[PI] Enviando texto al servidor LLM...")
+    _mark("t2_post_start")
     try:
         payload = {"text": text, "language": "es"}
-        response = requests.post(MAC_SERVER_URL, json=payload, timeout=90)
+        if battery_pct is not None:
+            payload["battery_pct"] = battery_pct
+        response = requests.post(SERVER_URL, json=payload, timeout=90)
         response.raise_for_status()
-        llm_response_text = response.json().get("response")
-        print("[PI] Respuesta LLM: '" + str(llm_response_text) + "'")
-        return llm_response_text
+        _mark("t3_llm_response_received")
+        llm_data = response.json()
+
+        # Desenvolver si el ROG envuelve en {"response": "<json_string>"}
+        resp_val = llm_data.get("response")
+        if isinstance(resp_val, str):
+            try:
+                inner = json.loads(resp_val)
+                if isinstance(inner, dict):
+                    llm_data = inner
+            except (json.JSONDecodeError, ValueError):
+                pass  # era texto plano, no JSON envuelto -> ok
+
+        result = json.dumps(llm_data, ensure_ascii=False)
+        print("[PI] Respuesta LLM: " + result)
+        return result
     except requests.exceptions.RequestException as e:
+        _mark("t3_llm_response_received")
         print("[PI] Error conexion servidor: " + str(e))
-        return '{"response": "No pude conectar con el servidor de Inteligencia Artificial."}'
+        return '{"response": "No pude conectar con el servidor de Inteligencia Artificial.", "gesture_sequence": []}'
+
 
 # ---------- EJECUCION DE MOVIMIENTOS ----------
 def _load_frames_from_file(file_path):
     """
     Lector generico para archivos de secuencia/gesto.
     Formato por linea:  [angulos x 16] + [velocidad, tiempo_ms]
-    Solo se usa el segundo valor del segundo par (tiempo_ms).
     """
     frames = []
     with open(file_path, "r") as f:
@@ -386,10 +582,10 @@ def _load_frames_from_file(file_path):
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(" + ")
-            angles = ast.literal_eval(parts[0])
+            parts     = line.split(" + ")
+            angles    = ast.literal_eval(parts[0])
             time_data = ast.literal_eval(parts[1])
-            time_ms = time_data[1]
+            time_ms   = time_data[1]
             frames.append({"angles": angles, "time_ms": time_ms})
     return frames
 
@@ -408,20 +604,29 @@ def load_sequence_from_file(sequence_name):
 
 
 def play_sequence(sequence_name, robot):
+    """
+    Ejecuta una secuencia bloqueante (movimiento completo).
+    Usa set_all_servos() — el ACK de cada frame es tolerado porque
+    las secuencias no son time-critical como los gestos paralelos.
+    """
     print("[ROBOT] Cargando secuencia '" + sequence_name + "'...")
     frames, error = load_sequence_from_file(sequence_name)
     if error:
         return None, error
 
     print("[ROBOT] Ejecutando '" + sequence_name + "' (" + str(len(frames)) + " frames)...")
+    first_frame = True
     for frame in frames:
-        angles = frame["angles"]
-        time_ms = frame["time_ms"]
-        travelling_units = max(1, int(time_ms / 20))
-        robot.servo_write_all(angles, travelling=travelling_units)
+        angles   = frame["angles"]
+        time_ms  = frame["time_ms"]
+        speed    = max(1, int(time_ms / 20))
+        if first_frame:
+            _mark("t7_usb_command_sent")
+            first_frame = False
+        robot.set_all_servos(angles, speed=speed)
         sleep(time_ms / 1000.0)
 
-    robot.servo_write_all(STATIC_POSES["init"], travelling=50)
+    robot.set_all_servos(STATIC_POSES["init"], speed=50)
     sleep(1)
     print("[ROBOT] Secuencia '" + sequence_name + "' finalizada.")
     return "hecho"
@@ -430,9 +635,9 @@ def play_sequence(sequence_name, robot):
 def play_gesture(gesture_name, robot):
     """
     Ejecuta un gesto corporal (archivo en gestures/).
-    Mismo formato que las secuencias. NO vuelve a 'init' al final
-    porque el siguiente gesto (o el caller speak_with_gestures)
-    se encarga de eso.
+    Usa _send_no_reply() para no esperar ACK en cada frame:
+    gestos mas fluidos y sincronizados con el audio.
+    NO vuelve a init al final — lo hace speak_with_gestures().
     """
     file_path = os.path.join(GESTURES_DIR, gesture_name + ".txt")
     if not os.path.exists(file_path):
@@ -447,222 +652,280 @@ def play_gesture(gesture_name, robot):
 
     print("[GESTURE] Ejecutando '" + gesture_name + "' (" + str(len(frames)) + " frames)...")
     for frame in frames:
-        angles = frame["angles"]
+        angles  = frame["angles"]
         time_ms = frame["time_ms"]
-        travelling_units = max(1, int(time_ms / 20))
-        robot.servo_write_all(angles, travelling=travelling_units)
+        speed   = max(1, int(time_ms / 20))
+        # _send_no_reply: envia el paquete HID sin esperar respuesta.
+        # Reduce la latencia de cada frame de ~20ms a <2ms.
+        pkt = robot._build_packet(0x23, list(angles) + [speed, 20])
+        robot._send_no_reply(pkt)
         sleep(time_ms / 1000.0)
 
-
-def play_choreography(name, robot):
-    if name not in AVAILABLE_CHOREOGRAPHIES:
-        return None, "Coreografia '" + name + "' no esta en el catalogo."
-
-    action_file = "actions/" + name + ".hts"
-    music_file = "music/" + name + ".mp3"
-
-    if not os.path.exists(action_file):
-        return None, "No se encontro el archivo de coreografia '" + action_file + "'."
-
-    print("[ROBOT] Cargando coreografia desde '" + action_file + "'...")
-    sequence = htsparser.parse_file(action_file)
-
-    has_music = os.path.exists(music_file)
-    music_thread = None
-
-    def play_music():
-        print("[MUSIC] Reproduciendo '" + music_file + "'...")
-        pygame.mixer.music.load(music_file)
-        pygame.mixer.music.play()
-
-    if has_music:
-        music_thread = threading.Thread(target=play_music)
-        music_thread.start()
-        sleep(0.5)
-    else:
-        print("[MUSIC] Sin musica asociada -- coreografia silenciosa.")
-
-    print("[ROBOT] Iniciando coreografia.")
-    for frame in sequence:
-        angles = frame["servos"]
-        travel_time_ms = frame["time"]
-        travelling_units = max(1, int(travel_time_ms / 20))
-        robot.servo_write_all(angles, travelling=travelling_units)
-        sleep(travel_time_ms / 1000.0)
-
-    if music_thread:
-        music_thread.join()
-    print("[ROBOT] Coreografia finalizada.")
-    return "He terminado la coreografia " + name.replace("_", " ") + ".", None
 
 # ---------- DESPACHADOR ----------
 def handle_robot_action(action_json, robot):
     """
-    Despacha la respuesta del LLM.
+    Despacha la respuesta del LLM (JSON string).
 
-    Retorna (response_text, gesture_sequence, error):
-      - response_text: texto a hablar (puede ser None)
-      - gesture_sequence: lista de gestos a ejecutar en paralelo
-                          al TTS (solo aplica si action_type es None)
-                          puede ser None
-      - error: mensaje de error si aplica (None en caso normal)
+    Retorna (response_text, gesture_sequence, error).
     """
     try:
         action_data = json.loads(action_json)
         action_type = action_data.get("action")
-        parameters = action_data.get("parameters") or {}
+        parameters  = action_data.get("parameters") or {}
+        _mark("t4_json_parsed")
+        _set_meta(action_type=(action_type or "response"))
 
-        # Caso 1: conversacional (sin "action") -> response + gestos opcionales
+        # Tipo 1: conversacional -> response + gestos opcionales
         if not action_type:
-            response_text = action_data.get("response", action_json)
+            response_text    = action_data.get("response", action_json)
             gesture_sequence = action_data.get("gesture_sequence")
-            # Validar que sea lista de strings
+
             if gesture_sequence is not None:
                 if not isinstance(gesture_sequence, list):
                     print("[ROBOT] gesture_sequence no es lista, ignorando.")
                     gesture_sequence = None
                 else:
-                    # Filtrar nombres no validos en el cliente para no
-                    # depender solo del LLM
                     valid = [g for g in gesture_sequence
                              if isinstance(g, str) and g in GESTURE_CATALOG]
-                    if len(valid) != len(gesture_sequence):
-                        invalid = set(gesture_sequence) - set(valid)
+                    invalid = set(gesture_sequence) - set(valid)
+                    if invalid:
                         print("[ROBOT] Gestos invalidos descartados: " + str(invalid))
                     gesture_sequence = valid if valid else None
+
+            # Fallback: si el LLM omitio gesture_sequence y la respuesta tiene
+            # 4+ palabras, asignar gestos por defecto segun duracion estimada.
+            # Esto compensa que LM Studio no hace enforcement de required.
+            if gesture_sequence is None and response_text:
+                words = len(response_text.split())
+                if words >= 4:
+                    dur_s = words / 2.5
+                    if dur_s <= 3.5:
+                        gesture_sequence = ["enfatizar_breve"]
+                    elif dur_s <= 7.0:
+                        gesture_sequence = ["explicar_derecha", "afirmar"]
+                    else:
+                        gesture_sequence = ["explicar_derecha", "hablar_relajado",
+                                            "explicar_izquierda"]
+                    print("[ROBOT] gesture_sequence ausente — fallback por duracion "
+                          + str(round(dur_s, 1)) + "s: " + str(gesture_sequence))
+
+            _set_meta(
+                response_text=response_text or "",
+                gesture_count=len(gesture_sequence) if gesture_sequence else 0,
+            )
             return response_text, gesture_sequence, None
 
-        # Caso 2: acciones fisicas (sin gestos paralelos)
-        print("[ROBOT] Accion recibida: " + str(action_type))
+        # Tipos 2-4: acciones fisicas
+        print("[ROBOT] Accion: " + str(action_type))
 
         if action_type == "execute_pose":
             pose_name = parameters.get("pose_name")
             if pose_name in STATIC_POSES:
-                robot.servo_write_all(STATIC_POSES[pose_name])
-                return "Entendido, ejecutando la pose " + str(pose_name).replace("_", " ") + ".", None, None
-            return None, None, "No se encontro la pose: '" + str(pose_name) + "'."
+                _mark("t7_usb_command_sent")
+                robot.set_all_servos(STATIC_POSES[pose_name], speed=50)
+                resp = action_data.get("response") or (
+                    "Ejecutando la pose " + str(pose_name).replace("_", " ") + "."
+                )
+                return resp, None, None
+            return None, None, "Pose desconocida: '" + str(pose_name) + "'."
 
         if action_type == "execute_sequence":
             sequence_name = parameters.get("sequence_name")
             if sequence_name in SEQUENCE_FILES:
                 result = play_sequence(sequence_name, robot)
-                # play_sequence devuelve "hecho" (string) o (None, error)
                 if isinstance(result, tuple):
                     return None, None, result[1]
-                return None, None, None
-            return None, None, "Secuencia '" + str(sequence_name) + "' desconocida."
-
-        if action_type == "execute_dance":
-            dance_name = parameters.get("dance_name")
-            if dance_name:
-                response, error = play_choreography(dance_name, robot)
-                return response, None, error
-            return None, None, "Nombre de baile no especificado."
+                resp = action_data.get("response") or None
+                return resp, None, None
+            return None, None, "Secuencia desconocida: '" + str(sequence_name) + "'."
 
         if action_type == "control_led":
             state = parameters.get("state", False)
             if isinstance(state, bool):
                 print("[ROBOT] LEDs " + ("ON" if state else "OFF"))
-                robot.leds(state)
-                return ("OK, " + ("encendiendo" if state else "apagando") + " las luces.", None, None)
+                _mark("t7_usb_command_sent")
+                robot.set_led(state)
+                resp = action_data.get("response") or (
+                    ("Encendiendo" if state else "Apagando") + " las luces."
+                )
+                return resp, None, None
             return None, None, "Estado invalido para LEDs."
 
         return None, None, "Accion '" + str(action_type) + "' no reconocida."
 
     except json.JSONDecodeError:
+        _mark("t4_json_parsed")
+        _set_meta(action_type="raw_text", response_text=action_json or "")
         return action_json, None, None
     except Exception as e:
-        return None, None, "Error ejecutando accion del robot: " + str(e)
+        return None, None, "Error ejecutando accion: " + str(e)
+
 
 # ---------- MAIN ----------
 def main():
+    global metrics
+
     print("Inicializando asistente de voz para Alpha 1S...")
 
-    pygame.mixer.init()
-    voice_model = initialize_piper_voice()
-    whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
-    recognizer = sr.Recognizer()
-    microphone = sr.Microphone(sample_rate=RATE)
+    if _METRICS_AVAILABLE:
+        metrics = InteractionMetrics(csv_path=METRICS_CSV_PATH)
+        print("[PI] Metricas activas -> " + METRICS_CSV_PATH)
+    else:
+        print("[PI] Corriendo SIN metricas.")
+
+    voice_model     = initialize_piper_voice()
+    recognizer      = sr.Recognizer()
+    microphone      = sr.Microphone(sample_rate=RATE, device_index=MIC_DEVICE_INDEX)
     audio_interface = pyaudio.PyAudio()
-    stream = audio_interface.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                                  input=True, frames_per_buffer=CHUNK)
+    stream          = audio_interface.open(
+        format=FORMAT, channels=CHANNELS, rate=RATE,
+        input=True, frames_per_buffer=CHUNK,
+        input_device_index=MIC_DEVICE_INDEX,
+    )
     stream.stop_stream()
 
-    robot = None
+    robot         = None
+    hb_stop_event = threading.Event()
+
     try:
-        print("[ROBOT] Conectando con el robot Alpha 1S...")
-        robot = Alpha1S()
-        robot.leds(False)
-        print("[ROBOT] Conexion establecida.")
+        print("[ROBOT] Conectando con Alpha 1S por USB HID...")
+        robot = Alpha1SUSB()
+        robot.connect()
+        robot.set_led(False)
+        print("[ROBOT] Conexion USB establecida.")
+        print("[ROBOT] HW: " + robot.get_hardware_version())
+        bat = robot.get_battery()
+        startup_pct = _parse_battery(bat)
+        if startup_pct is not None:
+            _battery_cache["pct"] = startup_pct
+            _battery_cache["ts"]  = time.time()
+        print("[ROBOT] Bateria: " + str(bat.get("level", "?")) + "% / " +
+              str(bat.get("voltage_mv", "?")) + "mV")
+        # Arrancar heartbeat para mantener conexion activa
+        _start_heartbeat(robot, hb_stop_event)
+        print("[ROBOT] Heartbeat USB activo cada " + str(USB_HEARTBEAT_INTERVAL) + "s.")
+        # Arrancar refresh de batería en background (cada 60s, cuando el robot está inactivo)
+        hb_stop_event_bat = threading.Event()
+        bat_thread = threading.Thread(
+            target=_battery_refresh_loop, args=(robot, hb_stop_event_bat), daemon=True
+        )
+        bat_thread.start()
     except Exception as e:
-        print("[ROBOT] No se pudo conectar. Error: " + str(e))
+        print("[ROBOT] No se pudo conectar: " + str(e))
+        print("[ROBOT] Continuando SIN robot (solo voz).")
 
     print("\n" + "=" * 50)
-    print("Asistente Alpha 1S iniciado")
+    print("Asistente Alpha 1S iniciado (transport: USB HID)")
     print("=" * 50)
 
-    # Saludo inicial: pose de saludo + mensaje hablado en paralelo.
     startup_greeting(robot, voice_model)
     sleep(1.5)
 
     try:
         while True:
             if listen_for_wake_word(recognizer, microphone):
-                if robot: robot.leds(True)
+                if robot:
+                    robot.set_led(True)
                 stream.start_stream()
                 audio_frames = record_audio(stream)
                 stream.stop_stream()
 
                 if not audio_frames:
+                    if metrics is not None:
+                        metrics.abort("no_audio_frames")
                     continue
 
-                audio_file = save_as_wav(audio_frames, audio_interface, TEMP_AUDIO_FILENAME)
-                transcribed_text = transcribe_audio_local(audio_file, whisper_model)
+                audio_file      = save_as_wav(audio_frames, audio_interface, TEMP_AUDIO_FILENAME)
+                transcribed_text = transcribe_audio_remote(audio_file)
                 os.remove(audio_file)
 
                 if transcribed_text and transcribed_text.strip():
+                    _set_meta(transcript=transcribed_text.strip())
                     print("[PI] Texto transcrito: '" + transcribed_text.strip() + "'")
-                    llm_output = query_llm_server(transcribed_text)
 
-                    if llm_output:
-                        response_to_speak = None
-                        gesture_sequence = None
+                    # Leer bateria una vez por interaccion (rapido: <5ms HID)
+                    battery_pct = _read_battery(robot)
+                    if battery_pct is not None:
+                        print("[BATTERY] Nivel actual: " + str(battery_pct) + "%")
 
-                        if robot:
-                            response_to_speak, gesture_sequence, error = handle_robot_action(
-                                llm_output, robot
-                            )
-                            if error:
-                                print("[ROBOT] ERROR: " + error)
-                                response_to_speak = "Tuve un problema al intentar esa accion."
-                                gesture_sequence = None
-                        else:
-                            try:
-                                data = json.loads(llm_output)
-                                response_to_speak = data.get("response", "No entendi la accion.")
-                            except json.JSONDecodeError:
-                                response_to_speak = llm_output
+                    # --- FASE 4: intentar streaming (opt-in) ---
+                    mode, sdata = ("fallback", None)
+                    if USE_STREAMING and robot:
+                        mode, sdata = try_streaming_turn(
+                            transcribed_text, voice_model, robot,
+                            battery_pct=battery_pct,
+                        )
 
-                        if response_to_speak:
-                            # Si hay gestos Y robot conectado, ejecucion paralela.
-                            # En otro caso, TTS normal sin gestos.
-                            if gesture_sequence and robot:
-                                speak_with_gestures(
-                                    response_to_speak, voice_model,
-                                    gesture_sequence, robot
+                    if mode == "done":
+                        pass  # conversacional ya hablado + gestos ejecutados
+
+                    elif mode == "action":
+                        llm_str = json.dumps(sdata, ensure_ascii=False)
+                        rt, _gs, err = handle_robot_action(llm_str, robot)
+                        if err:
+                            print("[ROBOT] ERROR: " + err)
+                            _set_meta(error=err)
+                            speak("Tuve un problema al intentar esa acci\u00f3n.", voice_model)
+                        elif rt:
+                            speak(rt, voice_model)
+
+                    else:
+                        # --- Flujo NO-streaming (el de hoy, intacto) ---
+                        llm_output = query_llm_server(transcribed_text,
+                                                      battery_pct=battery_pct)
+
+                        if llm_output:
+                            response_to_speak = None
+                            gesture_sequence  = None
+                            error             = None
+
+                            if robot:
+                                response_to_speak, gesture_sequence, error = handle_robot_action(
+                                    llm_output, robot
                                 )
+                                if error:
+                                    print("[ROBOT] ERROR: " + error)
+                                    _set_meta(error=error)
+                                    response_to_speak = "Tuve un problema al intentar esa acci\u00f3n."
+                                    gesture_sequence  = None
                             else:
-                                speak(response_to_speak, voice_model)
-                if robot: robot.leds(False)
+                                try:
+                                    data = json.loads(llm_output)
+                                    response_to_speak = data.get(
+                                        "response", "No entend\u00ed la acci\u00f3n."
+                                    )
+                                except json.JSONDecodeError:
+                                    response_to_speak = llm_output
+
+                            if response_to_speak:
+                                if gesture_sequence and robot:
+                                    speak_with_gestures(
+                                        response_to_speak, voice_model,
+                                        gesture_sequence, robot
+                                    )
+                                else:
+                                    speak(response_to_speak, voice_model)
+                else:
+                    _set_meta(error="empty_transcription")
+
+                if robot:
+                    robot.set_led(False)
+
+                if metrics is not None:
+                    metrics.commit()
 
     except KeyboardInterrupt:
         print("\n[PI] Apagando el asistente...")
     finally:
+        hb_stop_event.set()   # detener heartbeat
         if stream.is_active():
             stream.stop_stream()
         stream.close()
         audio_interface.terminate()
-        pygame.mixer.quit()
+        if robot:
+            robot.disconnect()
+            print("[ROBOT] Conexion USB cerrada.")
         # IMPORTANTE: NO apagar servos al salir; el robot caeria.
 
 
